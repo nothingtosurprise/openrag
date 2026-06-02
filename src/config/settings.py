@@ -3,6 +3,7 @@ import concurrent.futures
 import os
 import threading
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 from agentd.patch import patch_openai_with_mcp
@@ -67,6 +68,72 @@ OPENRAG_BACKEND_INTERNAL_URL = os.getenv(
     "OPENRAG_BACKEND_INTERNAL_URL",
     "http://openrag-backend:8000",
 ).rstrip("/")
+
+# --- Backend ingestion-callback proxy router ------------------------------
+# A standalone, minimal uvicorn app (spun up in the same process as the main
+# backend, on its own port) that proxies ONLY the Langflow ingest callback
+# (POST /internal/ingest/chunks) to the real backend. When enabled, Langflow is
+# pointed at the router instead of the backend internal URL, so Langflow's
+# reachable surface narrows to that single endpoint.
+INGEST_CALLBACK_PATH = "/internal/ingest/chunks"
+OPENRAG_BACKEND_ROUTER_ENABLE = os.getenv("OPENRAG_BACKEND_ROUTER_ENABLE", "false").lower() in (
+    "true",
+    "1",
+    "yes",
+)
+OPENRAG_BACKEND_ROUTER_HOST = os.getenv("OPENRAG_BACKEND_ROUTER_HOST", "0.0.0.0")
+OPENRAG_BACKEND_ROUTER_PORT = get_env_int("OPENRAG_BACKEND_ROUTER_PORT", 8100)
+
+
+def _derive_router_url() -> str:
+    """Default router URL: the backend host on the router port.
+
+    The router runs in the SAME pod/container as the backend, so it shares the
+    backend's host and differs only by port. Deriving from
+    OPENRAG_BACKEND_INTERNAL_URL means this resolves correctly in every
+    environment that var already works in (Helm, operator) with no new Service.
+    """
+    parts = urlsplit(OPENRAG_BACKEND_INTERNAL_URL)
+    host = parts.hostname or "openrag-backend"
+    netloc = f"{host}:{OPENRAG_BACKEND_ROUTER_PORT}"
+    return urlunsplit((parts.scheme or "http", netloc, "", "", ""))
+
+
+# Externally reachable base URL Langflow calls back to. Defaults to the backend
+# host on the router port; override only if fronted by a separate Service/ingress.
+OPENRAG_BACKEND_ROUTER_URL = (
+    os.getenv("OPENRAG_BACKEND_ROUTER_URL") or _derive_router_url()
+).rstrip("/")
+
+
+# Upstream the router FORWARDS callbacks to. The router is co-located with the
+# backend (same process), so the HOST is always loopback — but the scheme/port
+# are sourced from OPENRAG_BACKEND_INTERNAL_URL so the upstream tracks the
+# backend's configured port automatically. We force 127.0.0.1 (not the advertised
+# service name) because that name need not resolve where the router runs (e.g. a
+# host-run backend). Loopback is correct in every mode: host dev, single
+# container, and same k8s pod.
+def _derive_router_upstream_url() -> str:
+    parts = urlsplit(OPENRAG_BACKEND_INTERNAL_URL)
+    port = parts.port or 8000
+    return urlunsplit((parts.scheme or "http", f"127.0.0.1:{port}", "", "", ""))
+
+
+OPENRAG_BACKEND_ROUTER_UPSTREAM_URL = (
+    os.getenv("OPENRAG_BACKEND_ROUTER_UPSTREAM_URL") or _derive_router_upstream_url()
+).rstrip("/")
+
+
+def get_ingest_callback_url() -> str:
+    """URL Langflow should call back to: the router when enabled, else the backend."""
+    base = (
+        OPENRAG_BACKEND_ROUTER_URL
+        if OPENRAG_BACKEND_ROUTER_ENABLE
+        else OPENRAG_BACKEND_INTERNAL_URL
+    )
+    return f"{base}{INGEST_CALLBACK_PATH}"
+
+
 NUDGES_FLOW_ID = os.getenv("NUDGES_FLOW_ID") or "ebc01d31-1976-46ce-a385-b0240327226c"
 
 
