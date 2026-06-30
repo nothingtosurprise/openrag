@@ -796,10 +796,15 @@ ci-build-images: ## Build all OpenRAG images for CI artifact sharing
 	@set -e; \
 	IMAGE_TAG=$${OPENRAG_VERSION:-latest}; \
 	echo "$(YELLOW)Building all OpenRAG images with tag '$$IMAGE_TAG'...$(NC)"; \
-	$(CONTAINER_RUNTIME) build -t langflowai/openrag-opensearch:$$IMAGE_TAG -f Dockerfile .; \
-	$(CONTAINER_RUNTIME) build -t langflowai/openrag-backend:$$IMAGE_TAG -f Dockerfile.backend .; \
-	$(CONTAINER_RUNTIME) build -t langflowai/openrag-frontend:$$IMAGE_TAG -f Dockerfile.frontend .; \
-	$(CONTAINER_RUNTIME) build -t langflowai/openrag-langflow:$$IMAGE_TAG -f Dockerfile.langflow .
+	$(CONTAINER_RUNTIME) build -t langflowai/openrag-opensearch:$$IMAGE_TAG -f Dockerfile . & PID1=$$!; \
+	$(CONTAINER_RUNTIME) build -t langflowai/openrag-backend:$$IMAGE_TAG -f Dockerfile.backend . & PID2=$$!; \
+	$(CONTAINER_RUNTIME) build -t langflowai/openrag-frontend:$$IMAGE_TAG -f Dockerfile.frontend . & PID3=$$!; \
+	$(CONTAINER_RUNTIME) build -t langflowai/openrag-langflow:$$IMAGE_TAG -f Dockerfile.langflow . & PID4=$$!; \
+	wait $$PID1 || exit 1; \
+	wait $$PID2 || exit 1; \
+	wait $$PID3 || exit 1; \
+	wait $$PID4 || exit 1; \
+	echo "$(GREEN)All images built successfully!$(NC)"
 
 ci-save-images: ## Save CI-built OpenRAG images to .ci-artifacts/openrag-ci-images.tar
 	@set -e; \
@@ -818,8 +823,9 @@ test-ci-suite: ensure-langflow-data ensure-backend-volumes ## Run one CI integra
 
 test-ci: ensure-langflow-data ensure-backend-volumes ## Start infra, run integration + SDK tests, tear down (uses DockerHub images)
 	@set -e; \
+	TEST_RESULT=0; \
 	echo "$(YELLOW)Installing test dependencies...$(NC)"; \
-	uv sync --group dev; \
+	uv sync --quiet --group dev; \
 	echo "::group::Cleanup, Pull & Build Images"; \
 	echo "$(YELLOW)Cleaning up old containers and volumes...$(NC)"; \
 	$(COMPOSE_CMD) down -v 2>/dev/null || true; \
@@ -901,6 +907,7 @@ test-ci: ensure-langflow-data ensure-backend-volumes ## Start infra, run integra
 	echo "$(CYAN)════════════════════════════════════════$(NC)"; \
 	echo "$(PURPLE) Core Integration Tests$(NC)"; \
 	echo "$(CYAN)════════════════════════════════════════$(NC)"; \
+	mkdir -p service-logs; \
 	LOG_LEVEL=$${LOG_LEVEL:-DEBUG} \
 	GOOGLE_OAUTH_CLIENT_ID="" \
 	GOOGLE_OAUTH_CLIENT_SECRET="" \
@@ -908,8 +915,7 @@ test-ci: ensure-langflow-data ensure-backend-volumes ## Start infra, run integra
 	LANGFLOW_OPENSEARCH_HOST=opensearch LANGFLOW_OPENSEARCH_PORT=9200 \
 	OPENSEARCH_USERNAME=admin OPENSEARCH_PASSWORD=$${OPENSEARCH_PASSWORD} \
 	DISABLE_STARTUP_INGEST=$${DISABLE_STARTUP_INGEST:-true} \
-	uv run pytest tests/integration/core -vv -s -o log_cli=true --log-cli-level=DEBUG; \
-	TEST_RESULT=$$?; \
+	uv run pytest tests/integration/core -vv -s --log-file=service-logs/pytest-core.log --log-file-level=DEBUG --junitxml=service-logs/junit-core.xml || TEST_RESULT=1; \
 	echo "::endgroup::"; \
 	echo ""; \
 	echo "$(YELLOW)Waiting for frontend at http://localhost:3000...$(NC)"; \
@@ -920,8 +926,9 @@ test-ci: ensure-langflow-data ensure-backend-volumes ## Start infra, run integra
 	echo "$(CYAN)════════════════════════════════════════$(NC)"; \
 	echo "$(PURPLE) SDK Integration Tests (Python)$(NC)"; \
 	echo "$(CYAN)════════════════════════════════════════$(NC)"; \
-	uv pip install -e sdks/python; \
-	SDK_TESTS_ONLY=true OPENRAG_URL=http://localhost:3000 uv run pytest tests/integration/sdk/ -vv -s || TEST_RESULT=1; \
+	uv pip install --quiet -e sdks/python; \
+	mkdir -p service-logs; \
+	SDK_TESTS_ONLY=true OPENRAG_URL=http://localhost:3000 uv run pytest tests/integration/sdk/ -vv -s --log-file=service-logs/pytest-sdk.log --log-file-level=DEBUG --junitxml=service-logs/junit-sdk-python.xml || TEST_RESULT=1; \
 	echo "::endgroup::"; \
 	echo "::group::SDK Integration Tests (TypeScript)"; \
 	echo "$(CYAN)════════════════════════════════════════$(NC)"; \
@@ -929,11 +936,14 @@ test-ci: ensure-langflow-data ensure-backend-volumes ## Start infra, run integra
 	echo "$(CYAN)════════════════════════════════════════$(NC)"; \
 	cd sdks/typescript && \
 	npm install && npm run build && \
-	OPENRAG_URL=http://localhost:3000 npm test || TEST_RESULT=1; \
+	OPENRAG_URL=http://localhost:3000 npm test -- --reporter=junit --outputFile=../../service-logs/junit-sdk-typescript.xml || TEST_RESULT=1; \
 	cd ../..; \
 	echo "::endgroup::"; \
 	echo "$(CYAN)════════════════════════════════════════$(NC)"; \
 	echo ""; \
+	echo "::group::Test Failure Report"; \
+	uv run python scripts/ci/generate_test_report.py service-logs || true; \
+	echo "::endgroup::"; \
 	($(call test_jwt_opensearch)) || TEST_RESULT=1; \
 	echo "$(YELLOW)Tearing down infra$(NC)"; \
 	uv run python scripts/docling_ctl.py stop || true; \
@@ -942,8 +952,9 @@ test-ci: ensure-langflow-data ensure-backend-volumes ## Start infra, run integra
 
 test-ci-local: ensure-langflow-data ensure-backend-volumes ## Same as test-ci but builds all images locally
 	@set -e; \
+	TEST_RESULT=0; \
 	echo "$(YELLOW)Installing test dependencies...$(NC)"; \
-	uv sync --group dev; \
+	uv sync --quiet --group dev; \
 	echo "::group::Cleanup & Build Images"; \
 	echo "$(YELLOW)Cleaning up old containers and volumes...$(NC)"; \
 	$(COMPOSE_CMD) down -v 2>/dev/null || true; \
@@ -1026,6 +1037,7 @@ test-ci-local: ensure-langflow-data ensure-backend-volumes ## Same as test-ci bu
 	echo "$(CYAN)════════════════════════════════════════$(NC)"; \
 	echo "$(PURPLE) Core Integration Tests$(NC)"; \
 	echo "$(CYAN)════════════════════════════════════════$(NC)"; \
+	mkdir -p service-logs; \
 	LOG_LEVEL=$${LOG_LEVEL:-DEBUG} \
 	GOOGLE_OAUTH_CLIENT_ID="" \
 	GOOGLE_OAUTH_CLIENT_SECRET="" \
@@ -1033,8 +1045,7 @@ test-ci-local: ensure-langflow-data ensure-backend-volumes ## Same as test-ci bu
 	LANGFLOW_OPENSEARCH_HOST=opensearch LANGFLOW_OPENSEARCH_PORT=9200 \
 	OPENSEARCH_USERNAME=admin OPENSEARCH_PASSWORD=$${OPENSEARCH_PASSWORD} \
 	DISABLE_STARTUP_INGEST=$${DISABLE_STARTUP_INGEST:-true} \
-	uv run pytest tests/integration/core -vv -s -o log_cli=true --log-cli-level=DEBUG; \
-	TEST_RESULT=$$?; \
+	uv run pytest tests/integration/core -vv -s --log-file=service-logs/pytest-core.log --log-file-level=DEBUG --junitxml=service-logs/junit-core.xml || TEST_RESULT=1; \
 	echo "::endgroup::"; \
 	echo ""; \
 	echo "$(YELLOW)Waiting for frontend at http://localhost:3000...$(NC)"; \
@@ -1045,8 +1056,9 @@ test-ci-local: ensure-langflow-data ensure-backend-volumes ## Same as test-ci bu
 	echo "$(CYAN)════════════════════════════════════════$(NC)"; \
 	echo "$(PURPLE) SDK Integration Tests (Python)$(NC)"; \
 	echo "$(CYAN)════════════════════════════════════════$(NC)"; \
-	uv pip install -e sdks/python; \
-	SDK_TESTS_ONLY=true OPENRAG_URL=http://localhost:3000 uv run pytest tests/integration/sdk/ -vv -s || TEST_RESULT=1; \
+	uv pip install --quiet -e sdks/python; \
+	mkdir -p service-logs; \
+	SDK_TESTS_ONLY=true OPENRAG_URL=http://localhost:3000 uv run pytest tests/integration/sdk/ -vv -s --log-file=service-logs/pytest-sdk.log --log-file-level=DEBUG --junitxml=service-logs/junit-sdk-python.xml || TEST_RESULT=1; \
 	echo "::endgroup::"; \
 	echo "::group::SDK Integration Tests (TypeScript)"; \
 	echo "$(CYAN)════════════════════════════════════════$(NC)"; \
@@ -1054,21 +1066,22 @@ test-ci-local: ensure-langflow-data ensure-backend-volumes ## Same as test-ci bu
 	echo "$(CYAN)════════════════════════════════════════$(NC)"; \
 	cd sdks/typescript && \
 	npm install && npm run build && \
-	OPENRAG_URL=http://localhost:3000 npm test || TEST_RESULT=1; \
+	OPENRAG_URL=http://localhost:3000 npm test -- --reporter=junit --outputFile=../../service-logs/junit-sdk-typescript.xml || TEST_RESULT=1; \
 	cd ../..; \
 	echo "::endgroup::"; \
 	echo "$(CYAN)════════════════════════════════════════$(NC)"; \
 	echo ""; \
 	if [ $$TEST_RESULT -ne 0 ]; then \
-		echo "$(RED)=== Tests failed, dumping container logs ===$(NC)"; \
-		echo ""; \
-		echo "$(YELLOW)=== Langflow logs (last 500 lines) ===$(NC)"; \
-		$(CONTAINER_RUNTIME) logs langflow 2>&1 | tail -500 || echo "$(RED)Could not get Langflow logs$(NC)"; \
-		echo ""; \
-		echo "$(YELLOW)=== Backend logs (last 200 lines) ===$(NC)"; \
-		$(CONTAINER_RUNTIME) logs openrag-backend 2>&1 | tail -200 || echo "$(RED)Could not get backend logs$(NC)"; \
-		echo ""; \
+		echo "$(RED)=== Tests failed, saving container logs to service-logs/ ===$(NC)"; \
+		mkdir -p service-logs; \
+		$(CONTAINER_RUNTIME) logs langflow > service-logs/langflow.log 2>&1 || echo "$(RED)Could not get Langflow logs$(NC)"; \
+		$(CONTAINER_RUNTIME) logs openrag-backend > service-logs/backend.log 2>&1 || echo "$(RED)Could not get backend logs$(NC)"; \
+		$(CONTAINER_RUNTIME) logs openrag-frontend > service-logs/frontend.log 2>&1 || echo "$(RED)Could not get frontend logs$(NC)"; \
+		$(CONTAINER_RUNTIME) logs os > service-logs/opensearch.log 2>&1 || echo "$(RED)Could not get OpenSearch logs$(NC)"; \
 	fi; \
+	echo "::group::Test Failure Report"; \
+	uv run python scripts/ci/generate_test_report.py service-logs || true; \
+	echo "::endgroup::"; \
 	($(call test_jwt_opensearch)) || TEST_RESULT=1; \
 	echo "$(YELLOW)Tearing down infra$(NC)"; \
 	uv run python scripts/docling_ctl.py stop || true; \
