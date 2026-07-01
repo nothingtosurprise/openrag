@@ -11,7 +11,9 @@ from dependencies import (
     get_connector_service,
     get_current_user,
     get_db_session,
+    get_rbac_service,
     get_session_manager,
+    has_effective_permission,
     require_permission,
 )
 from services.connector_access_service import (
@@ -386,6 +388,10 @@ class ConnectorSyncBody(BaseModel):
     # rather than failing. Set by the provider upload UI after the user confirms
     # overwrite in the duplicate dialog.
     replace_duplicates: bool = False
+    # When True (COS only), index chunks without an owner field so OpenSearch DLS
+    # makes them visible to all users in the instance. Temporary CIO mechanism;
+    # not a full ACL feature. Defaults to False (private).
+    shared: bool = False
 
 
 class ConnectorCheckDuplicatesBody(BaseModel):
@@ -643,6 +649,7 @@ async def connector_sync(
     session_manager=Depends(get_session_manager),
     user: User = Depends(require_permission("connectors:use")),
     session: AsyncSession = Depends(get_db_session),
+    rbac=Depends(get_rbac_service),
 ):
     """Sync files from all active connections of a connector type"""
     if denied := await _connector_access_denied(request, session, connector_type):
@@ -671,6 +678,12 @@ async def connector_sync(
             max_files=max_files,
         )
         jwt_token = user.jwt_token
+
+        if body.shared and connector_type != "ibm_cos":
+            return JSONResponse(
+                {"error": "shared flag is only supported for the ibm_cos connector"},
+                status_code=400,
+            )
 
         # Get all active connections for this connector type and user
         connections = await connector_service.connection_manager.list_connections(
@@ -730,6 +743,17 @@ async def connector_sync(
             # Explicit files selected (e.g., from file picker) - sync those specific files
             from .documents import _ensure_index_exists
 
+            if body.shared and body.replace_duplicates:
+                if not await has_effective_permission(
+                    request, user, rbac, "knowledge:delete:anonymous"
+                ):
+                    return JSONResponse(
+                        {
+                            "error": "Replacing shared documents requires the knowledge:delete:anonymous permission"
+                        },
+                        status_code=403,
+                    )
+
             await _ensure_index_exists(jwt_token)
             task_id = await connector_service.sync_specific_files(
                 working_connection.connection_id,
@@ -739,6 +763,7 @@ async def connector_sync(
                 file_infos=file_infos,
                 ingest_settings=body.settings,
                 replace_duplicates=body.replace_duplicates,
+                shared=body.shared,
             )
         elif body.sync_all or body.bucket_filter:
             # Full ingest: discover and ingest all files (or files from specific buckets).
@@ -780,6 +805,7 @@ async def connector_sync(
                     all_file_ids,
                     jwt_token=jwt_token,
                     ingest_settings=body.settings,
+                    shared=body.shared,
                 )
             else:
                 # sync_all: ingest everything the connector can see
@@ -789,6 +815,7 @@ async def connector_sync(
                     max_files=max_files,
                     jwt_token=jwt_token,
                     ingest_settings=body.settings,
+                    shared=body.shared,
                 )
         else:
             # No files specified - sync only files already in OpenSearch for this connector
@@ -854,6 +881,7 @@ async def connector_sync(
                     jwt_token=jwt_token,
                     ingest_settings=body.settings,
                     replace_duplicates=_connector_sync_should_replace(connector_type),
+                    shared=body.shared,
                 )
             else:
                 # Fallback: use filename filtering (for Langflow-ingested files without document_id)
@@ -870,6 +898,7 @@ async def connector_sync(
                     filename_filter=set(existing_filenames),
                     ingest_settings=body.settings,
                     replace_duplicates=_connector_sync_should_replace(connector_type),
+                    shared=body.shared,
                 )
         task_ids = [task_id]
         await TelemetryClient.send_event(
